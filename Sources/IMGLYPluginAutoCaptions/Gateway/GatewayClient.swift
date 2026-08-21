@@ -29,9 +29,12 @@ struct GatewayClient: Sendable {
     }
   }
 
-  /// Uploads bytes to the gateway and returns the resulting asset URL: a presigned upload URL is
-  /// requested first, then the bytes are PUT to it directly (no auth on the PUT).
-  func upload(_ data: Data, contentType: String) async throws -> String {
+  /// Uploads a file to the gateway and returns the resulting asset URL: a presigned upload URL is
+  /// requested first, then the file is PUT to it directly (no auth on the PUT).
+  ///
+  /// `upload(for:fromFile:)` streams the body off disk, so a long recording is never resident while it
+  /// uploads.
+  func upload(_ file: URL, contentType: String) async throws -> String {
     var request = authorizedRequest(path: "v1/uploads")
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.httpBody = try JSONSerialization.data(withJSONObject: ["content_type": contentType])
@@ -44,7 +47,7 @@ struct GatewayClient: Sendable {
     var put = URLRequest(url: uploadURL, timeoutInterval: Self.requestTimeout)
     put.httpMethod = "PUT"
     put.setValue(contentType, forHTTPHeaderField: "Content-Type")
-    let (body, putResponse) = try await URLSession.shared.upload(for: put, from: data)
+    let (body, putResponse) = try await URLSession.shared.upload(for: put, fromFile: file)
     try Self.validate(putResponse, body: body)
     return metadata.assetURL
   }

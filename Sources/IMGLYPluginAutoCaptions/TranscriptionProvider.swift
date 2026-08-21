@@ -35,7 +35,9 @@ public protocol TranscriptionProvider: Sendable {
   /// Transcribes audio into SRT subtitle text.
   ///
   /// - Parameters:
-  ///   - audio: The audio data to transcribe.
+  ///   - audio: One audible block's whole source track, staged in a temporary file. Stream it — a
+  ///     scene's audio is unbounded, and reading the file into memory is what this parameter exists to
+  ///     avoid. The file is deleted once the generation ends, so do not keep the URL past this call.
   ///   - mimeType: The MIME type of `audio`, i.e. the source track's own type — commonly `audio/mp4`
   ///     (AAC, from a video's extracted track), `audio/wav`, or `audio/mpeg` (a standalone audio block).
   ///   - options: Language and subtitle formatting options.
@@ -44,5 +46,5 @@ public protocol TranscriptionProvider: Sendable {
   /// - Throws: Any transport or service error; it surfaces as a generation-failure alert in the
   ///   editor. The surrounding task is cancelled when the user taps Cancel, so implementations
   ///   should stay cooperatively cancellable (`URLSession`'s async APIs already are).
-  func transcribe(audio: Data, mimeType: String, options: TranscriptionOptions) async throws -> String
+  func transcribe(audio: URL, mimeType: String, options: TranscriptionOptions) async throws -> String
 }

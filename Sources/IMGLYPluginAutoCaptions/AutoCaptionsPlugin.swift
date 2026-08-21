@@ -1,5 +1,14 @@
+import Foundation
 import IMGLYEditor
 import IMGLYEngine
+
+/// Transcribes the scene's audible content into an SRT or VTT file, with cue timings relative to the page
+/// timeline, or `nil` when the audio holds no speech.
+///
+/// Declared here rather than shared with the editor: the editor's
+/// `EditorConfiguration.Builder.captionsGeneration(_:)` takes a plain function type, so this is the
+/// plugin's own name for it and nothing about transcription reaches the editor's module.
+public typealias CaptionsGenerator = @MainActor (_ engine: Engine) async throws -> URL?
 
 /// A plugin that adds automatic caption generation to the editor.
 ///
@@ -25,10 +34,11 @@ public final class AutoCaptionsPlugin: EditorConfiguration {
   ///   - provider: The speech-to-text backend, e.g. the built-in ``GatewayTranscriptionProvider``.
   ///   - options: Language and subtitle formatting options passed to the provider.
   public init(provider: any TranscriptionProvider, options: TranscriptionOptions = .init()) {
+    let generate: CaptionsGenerator = { engine in
+      try await AutoCaptionsGenerator.generateCaptionsFile(engine: engine, provider: provider, options: options)
+    }
     super.init { builder in
-      builder.captionsGeneration { engine in
-        try await AutoCaptionsGenerator.generateCaptionsFile(engine: engine, provider: provider, options: options)
-      }
+      builder.captionsGeneration(generate)
     }
   }
 }

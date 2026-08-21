@@ -1,5 +1,4 @@
 import Foundation
-import IMGLYEditor
 import IMGLYEngine
 import OSLog
 
@@ -41,7 +40,9 @@ enum AutoCaptionsGenerator {
   /// One audible block's exported audio, its MIME type, and the mapping needed to place its cues on the
   /// page timeline.
   private struct BlockAudio: Sendable {
-    let data: Data
+    /// The block's audio staged on disk. A file rather than `Data` because a scene's audible content is
+    /// unbounded — several clips, or one long recording, would otherwise all be resident at once.
+    let url: URL
     let mimeType: String
     let source: Source
     /// The block's position on the page timeline.
@@ -101,18 +102,29 @@ enum AutoCaptionsGenerator {
   private static let voiceoverKind = "voiceover"
 
   /// Generates a temporary SRT file with cues for all audible content in the scene.
-  /// - Throws: ``CaptionsGeneration/Error/noSpeech`` when there is nothing audible or nothing was
-  ///   transcribed; the first underlying error when every block fails to export or transcribe.
+  ///
+  /// Every block's audio is staged in a directory of its own, deleted however the run ends — including
+  /// the cancellation the sheet triggers. The SRT is written outside that directory, so the cleanup does
+  /// not take the file the editor is about to import.
+  ///
+  /// - Returns: The URL of the SRT file, or `nil` when there is nothing audible or nothing was
+  ///   transcribed.
+  /// - Throws: The first underlying error when every block fails to export or transcribe.
   static func generateCaptionsFile(
     engine: Engine,
     provider: any TranscriptionProvider,
     options: TranscriptionOptions,
-  ) async throws -> URL {
-    let audios = try await exportAudibleBlocks(engine: engine)
-    guard !audios.isEmpty else { throw CaptionsGeneration.Error.noSpeech }
+  ) async throws -> URL? {
+    let staging = FileManager.default.temporaryDirectory
+      .appendingPathComponent("imgly-auto-captions-\(UUID().uuidString)", isDirectory: true)
+    // Synchronous, so cancellation cannot skip it the way an `await` in a cancelled task would.
+    defer { try? FileManager.default.removeItem(at: staging) }
+
+    let audios = try await exportAudibleBlocks(engine: engine, staging: staging)
+    guard !audios.isEmpty else { return nil }
 
     let cues = try await transcribe(audios, provider: provider, options: options)
-    guard !cues.isEmpty else { throw CaptionsGeneration.Error.noSpeech }
+    guard !cues.isEmpty else { return nil }
 
     return try await writeSRT(cues)
   }
@@ -210,13 +222,15 @@ enum AutoCaptionsGenerator {
 
   // MARK: - Audio export (sequential, engine-bound)
 
-  private static func exportAudibleBlocks(engine: Engine) async throws -> [BlockAudio] {
+  private static func exportAudibleBlocks(engine: Engine, staging: URL) async throws -> [BlockAudio] {
     var audios: [BlockAudio] = []
     var firstError: (any Error)?
-    for candidate in audibleCandidates(engine: engine) {
+    try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+    for (index, candidate) in audibleCandidates(engine: engine).enumerated() {
       try Task.checkCancellation()
       do {
-        if let audio = try await exportAudio(from: candidate.id, source: candidate.source, engine: engine) {
+        if let audio = try await exportAudio(from: candidate.id, source: candidate.source, engine: engine,
+                                             to: staging.appendingPathComponent("audio-\(index)")) {
           audios.append(audio)
         }
       } catch is CancellationError {
@@ -273,9 +287,10 @@ enum AutoCaptionsGenerator {
     from block: DesignBlockID,
     source: Source,
     engine: Engine,
+    to destination: URL,
   ) async throws -> BlockAudio? {
     if source == .video {
-      return try await exportVideoAudio(from: block, engine: engine)
+      return try await exportVideoAudio(from: block, engine: engine, to: destination)
     }
 
     // Read the source directly: `exportAudio` routes through the page-audio encoder, which strips the page
@@ -283,9 +298,10 @@ enum AutoCaptionsGenerator {
     guard try isAudible(block, engine: engine) else { return nil }
     try await engine.block.forceLoadAVResource(block)
     guard let url = try audioFileURL(of: block, engine: engine),
-          let data = try await audioData(at: url, engine: engine) else { return nil }
+          try await stageAudio(at: url, engine: engine, to: destination) else { return nil }
     let mimeType = canonicalAudioMIMEType(try? await engine.editor.getMIMEType(url: url))
-    return blockAudio(data, mimeType: mimeType, source: source, of: block, trimmedBy: block, engine: engine)
+    return blockAudio(destination, mimeType: mimeType, source: source, of: block, trimmedBy: block,
+                      engine: engine)
   }
 
   /// The registered name for an audio MIME type, since the value reaches us from servers we do not control
@@ -307,7 +323,11 @@ enum AutoCaptionsGenerator {
   ///
   /// Destroying the block does *not* release the `BufferRegistry` buffer the extraction minted — only
   /// `destroyBuffer` does — so both are freed on every path out, throws and cancellation included.
-  private static func exportVideoAudio(from block: DesignBlockID, engine: Engine) async throws -> BlockAudio? {
+  private static func exportVideoAudio(
+    from block: DesignBlockID,
+    engine: Engine,
+    to destination: URL,
+  ) async throws -> BlockAudio? {
     guard try engine.block.supportsFill(block) else { return nil }
     let fill = try engine.block.getFill(block)
     guard try isAudible(fill, engine: engine) else { return nil }
@@ -323,8 +343,9 @@ enum AutoCaptionsGenerator {
         try? engine.editor.destroyBuffer(url: bufferURL)
       }
     }
-    guard let bufferURL, let data = try await audioData(at: bufferURL, engine: engine) else { return nil }
-    return blockAudio(data, mimeType: "audio/mp4", source: .video, of: block, trimmedBy: fill, engine: engine)
+    guard let bufferURL, try await stageAudio(at: bufferURL, engine: engine, to: destination) else { return nil }
+    return blockAudio(destination, mimeType: "audio/mp4", source: .video, of: block, trimmedBy: fill,
+                      engine: engine)
   }
 
   /// The source an audio block reads from; `nil` when `audio/fileURI` is unset or unparseable.
@@ -332,46 +353,102 @@ enum AutoCaptionsGenerator {
     URL(string: try engine.block.getString(audioBlock, property: "audio/fileURI"))
   }
 
-  /// Reads an audio source's whole contents; `nil` when it is empty.
-  private static func audioData(at url: URL, engine: Engine) async throws -> Data? {
-    let data = switch AudioReader(url: url) {
-    case .buffer: try bufferData(at: url, engine: engine)
-    case .resource: try resourceData(at: url, engine: engine)
-    case .remote: try await remoteData(at: url)
+  /// The ceiling on how much of a source is resident at once, whichever way it is read.
+  private static let chunkBytes = 1 << 20
+
+  /// Copies an audio source into `destination` a chunk at a time; `false` when the source is empty.
+  ///
+  /// Never materialised as one `Data`: a scene's audio is unbounded, and a single long recording is
+  /// enough to exhaust memory on its own.
+  private static func stageAudio(at url: URL, engine: Engine, to destination: URL) async throws -> Bool {
+    let written = switch AudioReader(url: url) {
+    case .buffer: try stageBuffer(at: url, engine: engine, to: destination)
+    case .resource: try stageResource(at: url, engine: engine, to: destination)
+    case .remote: try await stageRemote(at: url, to: destination)
     }
-    return data.isEmpty ? nil : data
+    if written <= 0 {
+      try? FileManager.default.removeItem(at: destination)
+    }
+    return written > 0
   }
 
-  private static func bufferData(at url: URL, engine: Engine) throws -> Data {
-    let length = try engine.editor.getBufferLength(url: url).uintValue
-    guard length > 0 else { return Data() }
-    return try engine.editor.getBufferData(url: url, offset: 0, length: length)
+  /// Sliced rather than read whole: `getBufferData` allocates whatever length it is asked for, so the
+  /// request itself is what has to stay bounded.
+  ///
+  /// The read stays on the main actor — the engine is single-threaded, so reading its buffer from
+  /// anywhere else would be reaching across that boundary — and each slice is written before the next is
+  /// asked for.
+  private static func stageBuffer(at url: URL, engine: Engine, to destination: URL) throws -> Int {
+    let length = Int(try engine.editor.getBufferLength(url: url).uintValue)
+    guard length > 0 else { return 0 }
+    let file = try openForWriting(destination)
+    defer { try? file.close() }
+    var written = 0
+    while written < length {
+      let chunk = try engine.editor.getBufferData(url: url, offset: UInt(written),
+                                                  length: UInt(min(chunkBytes, length - written)))
+      // A short read would otherwise spin: the offset never advances past it.
+      guard !chunk.isEmpty else { break }
+      try file.write(contentsOf: chunk)
+      written += chunk.count
+    }
+    return written
   }
 
   /// Only resources the engine already holds are readable — which the preceding `forceLoadAVResource`
   /// guarantees.
-  private static func resourceData(at url: URL, engine: Engine) throws -> Data {
-    var data = Data()
-    try engine.editor.getResourceData(url: url, chunkSize: 1 << 20) { chunk in
-      data.append(chunk)
+  ///
+  /// Each chunk is written inside the callback: the engine hands out a view it may reuse once the
+  /// callback returns, and holding the chunks to join afterwards is the allocation this avoids.
+  ///
+  /// A failed write stops the walk by returning `false` rather than throwing, so the error is raised here
+  /// instead of unwinding through the engine's callback.
+  private static func stageResource(at url: URL, engine: Engine, to destination: URL) throws -> Int {
+    let file = try openForWriting(destination)
+    defer { try? file.close() }
+    var written = 0
+    var failure: (any Error)?
+    try engine.editor.getResourceData(url: url, chunkSize: UInt(chunkBytes)) { chunk in
+      do {
+        try file.write(contentsOf: chunk)
+      } catch {
+        failure = error
+        return false
+      }
+      written += chunk.count
       return true
     }
-    return data
+    if let failure {
+      throw failure
+    }
+    return written
   }
 
-  private static func remoteData(at url: URL) async throws -> Data {
-    let (data, response) = try await URLSession.shared.data(from: url)
+  /// `download` streams the response straight to a temporary file, so a long recording never has to be
+  /// resident. Cancelling the generation aborts a download in progress, as `data(from:)` did.
+  private static func stageRemote(at url: URL, to destination: URL) async throws -> Int {
+    let (downloaded, response) = try await URLSession.shared.download(from: url)
     if let http = response as? HTTPURLResponse, !(200 ..< 300).contains(http.statusCode) {
+      try? FileManager.default.removeItem(at: downloaded)
       throw AudioSourceError.httpError(url: url, statusCode: http.statusCode)
     }
-    return data
+    try FileManager.default.moveItem(at: downloaded, to: destination)
+    return try destination.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
   }
 
-  /// Maps whole-track audio bytes to a `BlockAudio`, taking the timeline placement from `block` and
-  /// clipping cues to `trimmed`'s (playback-only) trim window and speed. A speed the engine cannot
+  /// Creates `destination` empty and opens it for writing; the caller closes the handle.
+  private static func openForWriting(_ destination: URL) throws -> FileHandle {
+    guard FileManager.default.createFile(atPath: destination.path, contents: nil) else {
+      throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: destination.path])
+    }
+    return try FileHandle(forWritingTo: destination)
+  }
+
+  /// Maps a staged whole-track audio file to a `BlockAudio`, taking the timeline placement from `block`
+  /// and clipping cues to `trimmed`'s (playback-only) trim window and speed. A speed the engine cannot
   /// report — or reports as non-positive or non-finite — falls back to real time.
   private static func blockAudio(
-    _ data: Data,
+    _ url: URL,
     mimeType: String,
     source: Source,
     of block: DesignBlockID,
@@ -382,7 +459,7 @@ enum AutoCaptionsGenerator {
     let trimLength = (try? engine.block.getTrimLength(trimmed)) ?? 0
     let windowEnd = trimLength > 0 ? trimOffset + trimLength : .infinity
     let speed = Double((try? engine.block.getPlaybackSpeed(trimmed)) ?? 1)
-    return BlockAudio(data: data, mimeType: mimeType, source: source,
+    return BlockAudio(url: url, mimeType: mimeType, source: source,
                       timeOffset: (try? engine.block.getTimeOffset(block)) ?? 0,
                       windowStart: trimOffset, windowEnd: windowEnd,
                       speed: speed.isFinite && speed > 0 ? speed : 1)
@@ -406,7 +483,7 @@ enum AutoCaptionsGenerator {
       for audio in audios {
         group.addTask {
           do {
-            let srt = try await provider.transcribe(audio: audio.data, mimeType: audio.mimeType, options: options)
+            let srt = try await provider.transcribe(audio: audio.url, mimeType: audio.mimeType, options: options)
             return .success(TranscribedBlock(srt: srt, source: audio.source, timeOffset: audio.timeOffset,
                                              windowStart: audio.windowStart,
                                              windowEnd: audio.windowEnd, speed: audio.speed))

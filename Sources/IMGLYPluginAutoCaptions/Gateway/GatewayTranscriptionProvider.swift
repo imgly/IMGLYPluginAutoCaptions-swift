@@ -18,7 +18,7 @@ public struct GatewayTranscriptionProvider: TranscriptionProvider {
     client = GatewayClient(apiKey: apiKey, gatewayURL: gatewayURL)
   }
 
-  public func transcribe(audio: Data, mimeType: String, options: TranscriptionOptions) async throws -> String {
+  public func transcribe(audio: URL, mimeType: String, options: TranscriptionOptions) async throws -> String {
     let audioURL = try await client.upload(audio, contentType: mimeType)
     try Task.checkCancellation()
 

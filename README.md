@@ -31,14 +31,16 @@ Editor(settings).imgly.configuration {
 
 The built-in ``GatewayTranscriptionProvider`` runs the ElevenLabs Scribe v2 speech-to-text model through the [IMG.LY AI Gateway](https://img.ly/) (`gateway.img.ly`). The gateway handles provider routing, billing, and asset storage, so you only supply an IMG.LY API key (`sk_…`) from the IMG.LY Dashboard — no separate speech-to-text account, no proxy server to host, and no third-party credentials shipping in your app.
 
-To integrate any other speech-to-text service, implement the ``TranscriptionProvider`` protocol — a single `transcribe(audio:mimeType:options:)` method that turns audio data into an SRT string:
+To integrate any other speech-to-text service, implement the ``TranscriptionProvider`` protocol — a single `transcribe(audio:mimeType:options:)` method that turns a staged audio file into an SRT string:
 
 ```swift
 struct MyTranscriptionProvider: TranscriptionProvider {
   let name = "My Speech-to-Text"
 
-  func transcribe(audio: Data, mimeType: String, options: TranscriptionOptions) async throws -> String {
-    // Send the audio to your service and return SRT text.
+  func transcribe(audio: URL, mimeType: String, options: TranscriptionOptions) async throws -> String {
+    // `audio` is one audible block's whole source track, staged in a temporary
+    // file. Stream it — `URLSession.upload(for:fromFile:)` does that for you —
+    // rather than reading it into memory, and return SRT text.
   }
 }
 ```
