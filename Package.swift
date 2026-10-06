@@ -8,7 +8,7 @@ let package = Package(
     .library(name: "IMGLYPluginAutoCaptions", targets: ["IMGLYPluginAutoCaptions"]),
   ],
   dependencies: [
-    .package(url: "https://github.com/imgly/IMGLYUI-swift.git", exact: "1.84.0-rc.0"),
+    .package(url: "https://github.com/imgly/IMGLYUI-swift.git", exact: "1.84.0-rc.1"),
   ],
   targets: [
     .target(
