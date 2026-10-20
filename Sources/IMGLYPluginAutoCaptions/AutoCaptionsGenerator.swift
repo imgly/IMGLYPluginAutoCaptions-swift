@@ -100,6 +100,8 @@ enum AutoCaptionsGenerator {
   /// A heuristic, not a contract: the kind the editor stamps on a recorded voiceover. An audio block with
   /// any other kind is still transcribed, it just doesn't get the narration ranking.
   private static let voiceoverKind = "voiceover"
+  /// The kind the editor stamps on an animated sticker.
+  private static let animatedStickerKind = "animatedSticker"
 
   /// Generates a temporary SRT file with cues for all audible content in the scene.
   ///
@@ -252,7 +254,7 @@ enum AutoCaptionsGenerator {
 
   /// Every block on the current page that could carry audible content, tagged with the source it counts
   /// as. Audio is found by *type* because its kind varies (the editor stamps voiceovers `voiceover`,
-  /// integrators use their own); video only by kind, since it shares the `graphic` type with images.
+  /// integrators use their own); video by *fill type*.
   ///
   /// Both queries search the whole scene, so other pages' blocks are filtered out: the SRT is imported
   /// into the current page, and their cues would land there at another page's local time offsets.
@@ -261,8 +263,19 @@ enum AutoCaptionsGenerator {
     let audio = ((try? engine.block.find(byType: .audio)) ?? []).map { id in
       (id: id, source: (try? engine.block.getKind(id)) == voiceoverKind ? Source.voiceover : .audio)
     }
-    let video = ((try? engine.block.find(byKind: "video")) ?? []).map { (id: $0, source: Source.video) }
+    let video = ((try? engine.block.find(byType: .graphic)) ?? [])
+      .filter { isVideoFootage($0, engine: engine) }
+      .map { (id: $0, source: Source.video) }
     return (audio + video).filter { isDescendant($0.id, of: page, engine: engine) }
+  }
+
+  /// A graphic with a video fill, except an animated sticker. GIF and APNG count: `exportAudio` drops them
+  /// for having no audio track.
+  private static func isVideoFootage(_ block: DesignBlockID, engine: Engine) -> Bool {
+    guard (try? engine.block.supportsFill(block)) == true,
+          let fill = try? engine.block.getFill(block),
+          (try? engine.block.getType(fill)) == FillType.video.rawValue else { return false }
+    return (try? engine.block.getKind(block)) != animatedStickerKind
   }
 
   /// Whether a block sits anywhere below `page` — directly, or nested in one of its tracks.
