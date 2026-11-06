@@ -1,4 +1,4 @@
-// swift-tools-version:6.3.1
+// swift-tools-version:6.3.3
 import PackageDescription
 
 let package = Package(
@@ -8,7 +8,7 @@ let package = Package(
     .library(name: "IMGLYPluginAutoCaptions", targets: ["IMGLYPluginAutoCaptions"]),
   ],
   dependencies: [
-    .package(url: "https://github.com/imgly/IMGLYUI-swift.git", exact: "1.85.2"),
+    .package(url: "https://github.com/imgly/IMGLYUI-swift.git", exact: "1.86.0-rc.1"),
   ],
   targets: [
     .target(
